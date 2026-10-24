@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -46,25 +47,36 @@ def setup_ffmpeg() -> str:
 
 
 FFMPEG_BIN = setup_ffmpeg()
+WORK_ROOT = "/var/tmp" if os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK) else "/tmp"
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 FORCE_INVITE_LINK = os.environ.get("FORCE_INVITE_LINK", "https://t.me/+LjoTJ6A-AIdkMTg1").strip()
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 ADMIN_ID_ENV = os.environ.get("ADMIN_ID", "").strip()
+WEBHOOK_SECRET = hashlib.sha256(f"vip_music:{BOT_TOKEN}".encode()).hexdigest()[:32] if BOT_TOKEN else ""
 
-STATE_FILE = "/tmp/music_bot_state.json"
+STATE_FILE = os.path.join(WORK_ROOT, "music_bot_state_v2.json")
 RUNTIME = {
     "channel_id": os.environ.get("CHANNEL_ID", "").strip(),
     "admin_id": int(ADMIN_ID_ENV) if ADMIN_ID_ENV.isdigit() else 0,
     "bot_username": "Music92827bot",
+    "base_url": RENDER_EXTERNAL_URL,
     "songs_sent": 0,
     "channel_shares": 0,
+    "hijacks_blocked": 0,
 }
 
 KNOWN_USERS: set[int] = set()
+SESSION_VERIFIED: set[int] = set()
 USER_FAVS: dict[int, list[dict]] = {}
 TRENDING_COUNTER: Counter = Counter()
 TRENDING_META: dict[str, dict] = {}
+
+USER_MODE: dict[int, str] = {}
+SEARCH_CACHE: dict[str, dict] = {}
+BATCH_CACHE: dict[str, list[dict]] = {}
+SHARE_CACHE: dict[str, dict] = {}
+LYRICS_CACHE: dict[str, str] = {}
 
 if os.path.exists(STATE_FILE):
     try:
@@ -75,27 +87,26 @@ if os.path.exists(STATE_FILE):
             if not RUNTIME["admin_id"]:
                 RUNTIME["admin_id"] = int(saved.get("admin_id", 0) or 0)
             KNOWN_USERS.update(int(u) for u in saved.get("users", []))
+            SESSION_VERIFIED.update(int(u) for u in saved.get("verified", []))
+            SEARCH_CACHE.update(saved.get("search_cache", {}))
     except Exception:
         pass
 
-processed_updates = deque(maxlen=600)
-job_semaphore = asyncio.Semaphore(2)
-
-USER_MODE: dict[int, str] = {}
-SEARCH_CACHE: dict[str, dict] = {}
-BATCH_CACHE: dict[str, list[dict]] = {}
-SHARE_CACHE: dict[str, dict] = {}
-LYRICS_CACHE: dict[str, str] = {}
+processed_updates = deque(maxlen=800)
+job_semaphore = asyncio.Semaphore(3)
 
 
 def persist_state():
     try:
+        recent_search = dict(list(SEARCH_CACHE.items())[-400:])
         with open(STATE_FILE, "w", encoding="utf-8") as sf:
             json.dump(
                 {
                     "channel_id": RUNTIME["channel_id"],
                     "admin_id": RUNTIME["admin_id"],
                     "users": list(KNOWN_USERS)[-5000:],
+                    "verified": list(SESSION_VERIFIED)[-5000:],
+                    "search_cache": recent_search,
                 },
                 sf,
             )
@@ -112,6 +123,26 @@ def save_channel_id(cid: str | int, admin_uid: int = 0):
         RUNTIME["admin_id"] = int(admin_uid)
     persist_state()
     logger.info(f"Saved Force-Join CHANNEL_ID = {cid_str}")
+
+
+def run_cmd(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        out, err = proc.communicate()
+        return subprocess.CompletedProcess(cmd, -9, out, err)
 
 
 async def tg_api(method: str, data: dict = None, files: dict = None, timeout: float = 120.0):
@@ -165,8 +196,8 @@ async def edit_text(
 def join_gate_keyboard() -> dict:
     return {
         "inline_keyboard": [
-            [{"text": " Channel ကို အရင် Join ရန် နှိပ်ပါ", "url": FORCE_INVITE_LINK}],
-            [{"text": " Join ပြီးပါပြီ (စစ်ဆေးမည်)", "callback_data": "verify_join"}],
+            [{"text": "📢 Channel ကို အရင် Join ရန် နှိပ်ပါ", "url": FORCE_INVITE_LINK}],
+            [{"text": "✅ Join ပြီးပါပြီ (စစ်ဆေးမည်)", "callback_data": "verify_join"}],
         ]
     }
 
@@ -174,11 +205,11 @@ def join_gate_keyboard() -> dict:
 def main_menu_keyboard() -> dict:
     return {
         "inline_keyboard": [
-            [{"text": " အဆိုတော်နာမည်ဖြင့် ရှာမည်", "callback_data": "mode:artist"}],
-            [{"text": " သီချင်းနာမည်ဖြင့် ရှာမည်", "callback_data": "mode:song"}],
+            [{"text": "🎤 အဆိုတော်နာမည်ဖြင့် ရှာမည်", "callback_data": "mode:artist"}],
+            [{"text": "🎵 သီချင်းနာမည်ဖြင့် ရှာမည်", "callback_data": "mode:song"}],
             [
-                {"text": " လူကြိုက်အများဆုံး", "callback_data": "menu:trending"},
-                {"text": " သိမ်းထားသော သီချင်းများ", "callback_data": "menu:favs"},
+                {"text": "🔥 လူကြိုက်အများဆုံး", "callback_data": "menu:trending"},
+                {"text": "❤️ သိမ်းထားသော သီချင်းများ", "callback_data": "menu:favs"},
             ],
         ]
     }
@@ -186,46 +217,77 @@ def main_menu_keyboard() -> dict:
 
 def switch_mode_row() -> list[dict]:
     return [
-        {"text": " အဆိုတော်ဖြင့်ရှာ", "callback_data": "mode:artist"},
-        {"text": " သီချင်းဖြင့်ရှာ", "callback_data": "mode:song"},
+        {"text": "🎤 အဆိုတော်ဖြင့်ရှာ", "callback_data": "mode:artist"},
+        {"text": "🎵 သီချင်းဖြင့်ရှာ", "callback_data": "mode:song"},
     ]
 
 
 JOIN_PROMPT_TEXT = (
-    " သီချင်း Bot ကို အသုံးပြုဖို့ အောက်က Channel လေးကို အရင် Join ပေးပါနော်!\n\n"
-    "1  Channel ကို အရင် Join ရန် နှိပ်ပါ ကိုနှိပ်ပြီး Join ပါ။\n"
-    "2 ပြီးရင်  Join ပြီးပါပြီ ကို နှိပ်လိုက်မှ ရှေ့ဆက်အသုံးပြုလို့ ရပါမယ်! "
+    "🔒 သီချင်း Bot ကို အသုံးပြုဖို့ အောက်က Channel လေးကို အရင် Join ပေးပါနော်!\n\n"
+    "1️⃣ 『📢 Channel ကို အရင် Join ရန် နှိပ်ပါ』 ကိုနှိပ်ပြီး Join ပါ။\n"
+    "2️⃣ ပြီးရင် 『✅ Join ပြီးပါပြီ』 ကို နှိပ်လိုက်မှ ရှေ့ဆက်အသုံးပြုလို့ ရပါမယ်! 🎵"
 )
 
 MAIN_MENU_TEXT = (
-    " VIP Music Studio Bot မှ ကြိုဆိုပါတယ်!\n\n"
-    " Album Cover ပုံ + သီချင်းစာသား (Lyrics) + Channel သို့ ပြန်လည်မျှဝေနိုင်သည့် စနစ်အပြည့်အစုံ ပါဝင်ပါသည်!\n"
-    "အောက်က ခလုတ်များမှ စိတ်ကြိုက်ရွေးချယ်ပါ "
+    "🎶 VIP Music Studio Bot မှ ကြိုဆိုပါတယ်!\n\n"
+    "✨ Album Cover ပုံ + သီချင်းစာသား (Lyrics) + Channel သို့ ပြန်လည်မျှဝေနိုင်သည့် စနစ်အပြည့်အစုံ ပါဝင်ပါသည်!\n"
+    "အောက်က ခလုတ်များမှ စိတ်ကြိုက်ရွေးချယ်ပါ 👇"
 )
 
 
-async def is_user_joined(user_id: int) -> bool:
+async def is_user_joined(user_id: int, from_verify_click: bool = False) -> bool:
+    """
+    Checks real-time Channel membership via Telegram API when CHANNEL_ID is configured,
+    and NEVER bricks/locks out users after a Render cold-start if CHANNEL_ID hasn't been captured yet!
+    """
+    if not user_id:
+        return False
     cid = RUNTIME.get("channel_id", "").strip()
     if not cid:
-        return False
+        if from_verify_click:
+            SESSION_VERIFIED.add(user_id)
+            persist_state()
+            return True
+        return user_id in SESSION_VERIFIED
+
     try:
-        res = await tg_api("getChatMember", {"chat_id": cid, "user_id": user_id}, timeout=15.0)
+        res = await tg_api("getChatMember", {"chat_id": cid, "user_id": user_id}, timeout=12.0)
         if not res.get("ok"):
+            desc = (res.get("description") or "").lower()
+            # If channel config error (e.g. bot not admin), don't permanently brick users who clicked verify
+            if "chat not found" in desc or "administrator" in desc or "forbidden" in desc:
+                logger.warning(f"getChatMember config warning ({cid}): {desc}")
+                if from_verify_click:
+                    SESSION_VERIFIED.add(user_id)
+                    return True
+                return user_id in SESSION_VERIFIED
             return False
         member = res.get("result", {})
         status = member.get("status", "")
         if status in ("creator", "administrator", "member"):
+            SESSION_VERIFIED.add(user_id)
             return True
         if status == "restricted" and member.get("is_member") is True:
+            SESSION_VERIFIED.add(user_id)
             return True
+        SESSION_VERIFIED.discard(user_id)
         return False
-    except Exception:
-        return False
+    except Exception as e:
+        logger.warning(f"is_user_joined network warning: {e}")
+        return user_id in SESSION_VERIFIED
+
+
+def normalize_webhook_url(base_url: str) -> str:
+    clean_base = base_url.rstrip("/")
+    if clean_base.startswith("http://") and "localhost" not in clean_base and "127.0.0.1" not in clean_base:
+        clean_base = "https://" + clean_base[len("http://") :]
+    return f"{clean_base}/webhook"
 
 
 async def register_webhook(base_url: str) -> dict:
     if not BOT_TOKEN or not base_url:
         return {"ok": False}
+    RUNTIME["base_url"] = base_url
     try:
         me = await tg_api("getMe", timeout=10.0)
         uname = me.get("result", {}).get("username")
@@ -233,32 +295,58 @@ async def register_webhook(base_url: str) -> dict:
             RUNTIME["bot_username"] = uname
     except Exception:
         pass
-    clean_base = base_url.rstrip("/")
-    if clean_base.startswith("http://") and "localhost" not in clean_base and "127.0.0.1" not in clean_base:
-        clean_base = "https://" + clean_base[len("http://") :]
-    webhook_url = f"{clean_base}/webhook"
-    res = await tg_api(
-        "setWebhook",
-        {
-            "url": webhook_url,
-            "drop_pending_updates": False,
-            "allowed_updates": ["message", "callback_query", "channel_post", "my_chat_member"],
-        },
-    )
+    webhook_url = normalize_webhook_url(base_url)
+    payload = {
+        "url": webhook_url,
+        "drop_pending_updates": False,
+        "allowed_updates": ["message", "callback_query", "channel_post", "my_chat_member"],
+    }
+    if WEBHOOK_SECRET:
+        payload["secret_token"] = WEBHOOK_SECRET
+    res = await tg_api("setWebhook", payload, timeout=15.0)
     return res
+
+
+async def webhook_watchdog_loop():
+    """
+    Runs every 45s to automatically defeat third-party webhook hijackers (like bots.su!)
+    that try to steal @Music92827bot's webhook away from Render!
+    """
+    while True:
+        await asyncio.sleep(45)
+        base = RUNTIME.get("base_url") or RENDER_EXTERNAL_URL
+        if not BOT_TOKEN or not base:
+            continue
+        expected = normalize_webhook_url(base)
+        try:
+            info = await tg_api("getWebhookInfo", timeout=12.0)
+            cur_url = (info.get("result") or {}).get("url", "")
+            if cur_url != expected:
+                logger.warning(f"Webhook hijack detected ({cur_url})! Reclaiming -> {expected}")
+                await register_webhook(base)
+                RUNTIME["hijacks_blocked"] += 1
+        except Exception as e:
+            logger.warning(f"Watchdog warning: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    wd_task = asyncio.create_task(webhook_watchdog_loop())
     if RENDER_EXTERNAL_URL and BOT_TOKEN:
         try:
             await register_webhook(RENDER_EXTERNAL_URL)
         except Exception as e:
             logger.error(f"Startup webhook error: {e}")
     yield
+    wd_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/healthz")
+async def healthz():
+    return JSONResponse({"ok": True, "hijacks_blocked": RUNTIME["hijacks_blocked"]})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -272,11 +360,11 @@ async def index(request: Request):
             wh_ok = bool(r.get("ok"))
         except Exception:
             wh_ok = False
-    cid_badge = "FORCE-JOIN ACTIVE" if RUNTIME["channel_id"] else "AWAITING CHANNEL ADMIN"
+    cid_badge = "FORCE-JOIN ACTIVE" if RUNTIME["channel_id"] else "SMART GATE READY"
     bname = RUNTIME["bot_username"]
     html_page = f"""<!DOCTYPE html>
 <html lang="my"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VIP Music Workflow  @{bname}</title>
+<title>VIP Music Workflow (v2) · @{bname}</title>
 <style>
   body {{ background: radial-gradient(circle at 20% 10%, #0d2b26 0%, #060911 60%); color: #f8fafc; font-family: sans-serif; margin: 0; padding: 24px 16px 50px; }}
   .wrap {{ max-width: 720px; margin: 0 auto; }}
@@ -291,25 +379,21 @@ async def index(request: Request):
 </style></head>
 <body><div class="wrap">
   <div class="top">
-    <div><b> VIP MUSIC WORKFLOW ENGINE</b><div style="font-size:12px;color:#94a3b8;">@{bname}  {len(KNOWN_USERS)} Users  {RUNTIME["songs_sent"]} MP3s  {RUNTIME["channel_shares"]} Shares</div></div>
-    <div style="display:flex;gap:8px;"><span class="pill">{"WEBHOOK READY" if wh_ok else "CONNECTING"}</span><span class="pill">{cid_badge}</span></div>
+    <div><b>🎵 VIP MUSIC WORKFLOW ENGINE (v2 · Anti-Freeze Guard)</b><div style="font-size:12px;color:#94a3b8;">@{bname} · {len(KNOWN_USERS)} Users · {RUNTIME["songs_sent"]} MP3s · {RUNTIME["hijacks_blocked"]} Hijacks Blocked</div></div>
+    <div style="display:flex;gap:8px;"><span class="pill">{"WEBHOOK GUARD ACTIVE" if wh_ok else "CONNECTING"}</span><span class="pill">{cid_badge}</span></div>
   </div>
-  <h1>Force-Join &amp; Social Music Pipeline</h1>
-  <div class="sub">Channel Gate  Artist/Song Discovery  Cover Art + Lyrics  Anonymous/Public Channel Share</div>
-  <div class="node"><div class="ico"></div><div><b>NODE 01  Force-Join Channel Gate</b><div style="font-size:13px;color:#94a3b8;">Channel မဝင်မချင်း ရှေ့ဆက်ခွင့်ပိတ်ထားပြီး Member ဖြစ်မှ သီချင်းရှာခွင့်ပြုခြင်း</div></div></div>
+  <h1>Force-Join &amp; Social Music Pipeline (v2)</h1>
+  <div class="sub">Auto Webhook Watchdog ➔ Non-Blocking Instant Queue ➔ Cover Art + Lyrics ➔ Channel Share</div>
+  <div class="node"><div class="ico">🛡️</div><div><b>NODE 01 · Anti-Hijack Webhook Watchdog + Smart Gate</b><div style="font-size:13px;color:#94a3b8;">၄၅ စက္ကန့်တိုင်း Webhook စစ်ဆေးကာ bots.su ကြားဖြတ်မှုကို အလိုအလျောက် ကာကွယ်ပေးခြင်း</div></div></div>
   <div class="wire"></div>
-  <div class="node"><div class="ico"></div><div><b>NODE 02  Artist Catalog &amp; Exact Song Matcher</b><div style="font-size:13px;color:#94a3b8;">အဆိုတော်အလိုက် သီချင်းအားလုံးရွေးယူနိုင်ခြင်း နှင့် သီချင်းနာမည်မှန်ပါက MP3 တန်းပို့ပေးခြင်း</div></div></div>
+  <div class="node"><div class="ico">🎤</div><div><b>NODE 02 · Artist Catalog &amp; Exact Song Matcher</b><div style="font-size:13px;color:#94a3b8;">အဆိုတော်အလိုက် သီချင်းအားလုံးရွေးယူနိုင်ခြင်း နှင့် သီချင်းနာမည်မှန်ပါက MP3 တန်းပို့ပေးခြင်း</div></div></div>
   <div class="wire"></div>
-  <div class="node"><div class="ico"></div><div><b>NODE 03  Album Cover Art + Live Lyrics</b><div style="font-size:13px;color:#94a3b8;">MP3 တွင် မူရင်း Cover ပုံ၊ အဆိုတော်အမည် ထည့်သွင်းပြီး သီချင်းစာသား ကြည့်ရှုနိုင်ခြင်း</div></div></div>
+  <div class="node"><div class="ico">🖼️</div><div><b>NODE 03 · Album Cover Art + Live Lyrics</b><div style="font-size:13px;color:#94a3b8;">MP3 တွင် မူရင်း Cover ပုံ၊ အဆိုတော်အမည် ထည့်သွင်းပြီး သီချင်းစာသား ကြည့်ရှုနိုင်ခြင်း</div></div></div>
   <div class="wire"></div>
-  <div class="node"><div class="ico"></div><div><b>NODE 04  Channel Community Share (Profile On/Off)</b><div style="font-size:13px;color:#94a3b8;">နားထောင်ခဲ့သော သီချင်းကို Profile ဖော်၍ဖြစ်စေ၊ Profile ဖျောက်၍ဖြစ်စေ Channel ပေါ် တန်းတင်နိုင်ခြင်း</div></div></div>
-  <div style="text-align:center;"><a class="btn" href="https://t.me/{bname}" target="_blank"> Open @{bname}</a></div>
+  <div class="node"><div class="ico">📢</div><div><b>NODE 04 · Channel Community Share (Profile On/Off)</b><div style="font-size:13px;color:#94a3b8;">နားထောင်ခဲ့သော သီချင်းကို Profile ဖော်၍ဖြစ်စေ၊ Profile ဖျောက်၍ဖြစ်စေ Channel ပေါ် တန်းတင်နိုင်ခြင်း</div></div></div>
+  <div style="text-align:center;"><a class="btn" href="https://t.me/{bname}" target="_blank">🚀 Open @{bname}</a></div>
 </div></body></html>"""
     return HTMLResponse(content=html_page)
-
-
-def run_cmd(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
 
 
 def fmt_dur(sec_val) -> str:
@@ -325,6 +409,7 @@ def cache_track(tr: dict) -> str:
     SEARCH_CACHE[key] = tr
     if len(SEARCH_CACHE) > 2000:
         SEARCH_CACHE.pop(next(iter(SEARCH_CACHE)))
+    persist_state()
     return key
 
 
@@ -345,10 +430,12 @@ async def search_tracks(query: str, max_items: int = 10) -> list[dict]:
         "yt-dlp",
         "--flat-playlist",
         "--no-warnings",
+        "--socket-timeout",
+        "12",
         "--dump-json",
         f"scsearch{fetch_n}:{query}",
     ]
-    proc = await asyncio.to_thread(run_cmd, cmd, 30)
+    proc = await asyncio.to_thread(run_cmd, cmd, 25)
     for line in proc.stdout.decode(errors="ignore").splitlines():
         line = line.strip()
         if not line:
@@ -384,12 +471,14 @@ async def search_tracks(query: str, max_items: int = 10) -> list[dict]:
             "yt-dlp",
             "--flat-playlist",
             "--no-warnings",
+            "--socket-timeout",
+            "12",
             "--extractor-args",
             "youtube:player_client=android_vr,ios,mweb",
             "--dump-json",
             f"ytsearch{max_items}:{query}",
         ]
-        proc2 = await asyncio.to_thread(run_cmd, cmd_yt, 25)
+        proc2 = await asyncio.to_thread(run_cmd, cmd_yt, 22)
         for line in proc2.stdout.decode(errors="ignore").splitlines():
             try:
                 item = json.loads(line.strip())
@@ -466,7 +555,7 @@ async def fetch_song_lyrics(search_title: str) -> str:
                 for it in items:
                     plain = (it.get("plainLyrics") or "").strip()
                     if plain and len(plain) > 40:
-                        header = f" {it.get('trackName', '')}  {it.get('artistName', '')}\n\n"
+                        header = f"📜 {it.get('trackName', '')} — {it.get('artistName', '')}\n\n"
                         full_l = (header + plain)[:3900]
                         LYRICS_CACHE[search_title] = full_l
                         return full_l
@@ -484,6 +573,10 @@ async def download_song_with_cover(target_url: str, fallback_query: str, work_di
             "yt-dlp",
             "--no-playlist",
             "--no-warnings",
+            "--socket-timeout",
+            "15",
+            "--retries",
+            "2",
             "--write-info-json",
             "--extractor-args",
             "youtube:player_client=android_vr,ios,mweb,tv_downgraded",
@@ -504,6 +597,10 @@ async def download_song_with_cover(target_url: str, fallback_query: str, work_di
                     "yt-dlp",
                     "--no-playlist",
                     "--no-warnings",
+                    "--socket-timeout",
+                    "15",
+                    "--retries",
+                    "2",
                     "--write-info-json",
                     "-f",
                     "bestaudio/best",
@@ -518,8 +615,11 @@ async def download_song_with_cover(target_url: str, fallback_query: str, work_di
     for cmd in attempts:
         for fn in os.listdir(work_dir):
             if fn.startswith("track."):
-                os.remove(os.path.join(work_dir, fn))
-        await asyncio.to_thread(run_cmd, cmd, 120)
+                try:
+                    os.remove(os.path.join(work_dir, fn))
+                except Exception:
+                    pass
+        await asyncio.to_thread(run_cmd, cmd, 90)
         for fn in os.listdir(work_dir):
             if fn.endswith(".info.json"):
                 try:
@@ -563,7 +663,7 @@ async def download_song_with_cover(target_url: str, fallback_query: str, work_di
 
     if thumb_url and thumb_url.startswith("http"):
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
                 tr = await client.get(thumb_url)
                 if tr.status_code == 200 and len(tr.content) > 800:
                     raw_img = os.path.join(work_dir, "raw_thumb.img")
@@ -621,7 +721,7 @@ async def download_song_with_cover(target_url: str, fallback_query: str, work_di
         f"artist={artist or 'VIP Music'}",
         final_mp3,
     ]
-    await asyncio.to_thread(run_cmd, ff_args, 90)
+    await asyncio.to_thread(run_cmd, ff_args, 80)
 
     if not os.path.exists(final_mp3) or os.path.getsize(final_mp3) < 10_000:
         return None
@@ -648,13 +748,13 @@ async def send_single_mp3(
         await send_text(chat_id, JOIN_PROMPT_TEXT, reply_to=reply_to, reply_markup=join_gate_keyboard())
         return
 
-    status_id = await send_text(chat_id, f" Album Cover + MP3 ပြင်ဆင်နေပါပြီ...\n {title_hint or url}", reply_to=reply_to)
+    status_id = await send_text(chat_id, f"🎧 Album Cover + MP3 ပြင်ဆင်နေပါပြီ...\n🎵 {title_hint or url}", reply_to=reply_to)
     async with job_semaphore:
-        work_dir = tempfile.mkdtemp(prefix="music_dl_")
+        work_dir = tempfile.mkdtemp(prefix="music_dl_", dir=WORK_ROOT)
         try:
             meta = await download_song_with_cover(url, title_hint, work_dir)
             if not meta:
-                await edit_text(chat_id, status_id, " ဒီသီချင်းဖိုင်ကို ဆွဲလို့ မရပါဘူးနော်။ တခြားသီချင်းတစ်ပုဒ် ရွေးကြည့်ပေးပါ!")
+                await edit_text(chat_id, status_id, "❌ ဒီသီချင်းဖိုင်ကို ဆွဲလို့ မရပါဘူးနော်။ တခြားသီချင်းတစ်ပုဒ် ရွေးကြည့်ပေးပါ!")
                 return
 
             full_label = meta["full_label"]
@@ -670,14 +770,14 @@ async def send_single_mp3(
             TRENDING_COUNTER[t_key] += 1
             TRENDING_META[t_key] = tr_obj
 
-            await edit_text(chat_id, status_id, f" Telegram ဆီ သီချင်းပို့ပေးနေပါပြီ...\n {full_label}")
+            await edit_text(chat_id, status_id, f"📤 Telegram ဆီ သီချင်းပို့ပေးနေပါပြီ...\n🎵 {full_label}")
             safe_filename = re.sub(r'[\\/:*?"<>|]+', "_", full_label)[:80] + ".mp3"
 
             song_buttons = {
                 "inline_keyboard": [
                     [
-                        {"text": " သီချင်းစာသား (Lyrics)", "callback_data": f"lyr:{t_key}"},
-                        {"text": " သိမ်းထားမည်", "callback_data": f"fav:{t_key}"},
+                        {"text": "📜 သီချင်းစာသား (Lyrics)", "callback_data": f"lyr:{t_key}"},
+                        {"text": "❤️ သိမ်းထားမည်", "callback_data": f"fav:{t_key}"},
                     ],
                     switch_mode_row(),
                 ]
@@ -687,7 +787,7 @@ async def send_single_mp3(
                 "chat_id": str(chat_id),
                 "title": meta["title"][:100],
                 "performer": meta["artist"][:80],
-                "caption": f" {meta['title']}\n {meta['artist']}",
+                "caption": f"🎵 {meta['title']}\n🎤 {meta['artist']}",
                 "reply_markup": json.dumps(song_buttons),
             }
             if meta["duration"] > 0:
@@ -702,7 +802,7 @@ async def send_single_mp3(
                             "audio": (safe_filename, af, "audio/mpeg"),
                             "thumbnail": ("cover.jpg", cf, "image/jpeg"),
                         },
-                        timeout=200.0,
+                        timeout=180.0,
                     )
             else:
                 with open(meta["mp3_path"], "rb") as af:
@@ -710,7 +810,7 @@ async def send_single_mp3(
                         "sendAudio",
                         data=form_data,
                         files={"audio": (safe_filename, af, "audio/mpeg")},
-                        timeout=200.0,
+                        timeout=180.0,
                     )
 
             if res.get("ok"):
@@ -720,7 +820,6 @@ async def send_single_mp3(
                 except Exception:
                     pass
 
-                # Capture Telegram's audio file_id so sharing to Channel takes 0.1s with zero re-upload!
                 sent_msg = res.get("result", {})
                 audio_file_id = (sent_msg.get("audio") or {}).get("file_id")
                 sent_msg_id = sent_msg.get("message_id")
@@ -736,23 +835,23 @@ async def send_single_mp3(
                     )
                     share_prompt_kb = {
                         "inline_keyboard": [
-                            [{"text": " Profile ဖော်ပြီး Channel မှာတင်မည်", "callback_data": f"shpub:{skey}"}],
-                            [{"text": " Profile ဖျောက်ပြီး Channel မှာတင်မည်", "callback_data": f"shanon:{skey}"}],
-                            [{"text": " မတင်တော့ပါ", "callback_data": "shno"}],
+                            [{"text": "👤 Profile ဖော်ပြီး Channel မှာတင်မည်", "callback_data": f"shpub:{skey}"}],
+                            [{"text": "🕵️ Profile ဖျောက်ပြီး Channel မှာတင်မည်", "callback_data": f"shanon:{skey}"}],
+                            [{"text": "❌ မတင်တော့ပါ", "callback_data": "shno"}],
                         ]
                     }
                     await send_text(
                         chat_id,
-                        f" အခုနားထောင်နေတဲ့ {meta['title']} သီချင်းလေးကို Channel ပေါ် ပြန်တင်ပေးချင်ပါသလား?\n"
-                        "(Profile ဖော်ပြီးတင်မလား၊ ဖျောက်ပြီးတင်မလား စိတ်ကြိုက်ရွေးနိုင်ပါတယ် )",
+                        f"📢 အခုနားထောင်နေတဲ့ 『{meta['title']}』 သီချင်းလေးကို Channel ပေါ် ပြန်တင်ပေးချင်ပါသလား?\n"
+                        "(Profile ဖော်ပြီးတင်မလား၊ ဖျောက်ပြီးတင်မလား စိတ်ကြိုက်ရွေးနိုင်ပါတယ် 👇)",
                         reply_to=sent_msg_id,
                         reply_markup=share_prompt_kb,
                     )
             else:
-                await edit_text(chat_id, status_id, f" သီချင်းပို့ရာတွင် အခက်အခဲရှိပါသည်: {res}")
+                await edit_text(chat_id, status_id, f"⚠️ သီချင်းပို့ရာတွင် အခက်အခဲရှိပါသည်: {res}")
         except Exception as e:
             logger.exception("Music delivery error")
-            await edit_text(chat_id, status_id, f" အမှားတစ်ခု ဖြစ်သွားပါတယ်: {str(e)[:180]}")
+            await edit_text(chat_id, status_id, f"❌ အမှားတစ်ခု ဖြစ်သွားပါတယ်: {str(e)[:180]}")
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -763,13 +862,12 @@ async def send_batch_mp3(chat_id: int, user_id: int, tracks: list[dict]):
         return
     info_id = await send_text(
         chat_id,
-        f" ရွေးချယ်ထားသော သီချင်း ({len(tracks)}) ပုဒ်လုံးကို Album Cover နှင့်တကွ MP3 ပို့ပေးနေပါပြီ...",
+        f"📥 ရွေးချယ်ထားသော သီချင်း ({len(tracks)}) ပုဒ်လုံးကို Album Cover နှင့်တကွ MP3 ပို့ပေးနေပါပြီ...",
     )
     for idx, tr in enumerate(tracks):
-        # Ask channel share on the last song so user doesn't get flooded during batch download
         ask_sh = idx == len(tracks) - 1
         await send_single_mp3(chat_id, user_id, tr["url"], tr["title"], ask_channel_share=ask_sh)
-    await edit_text(chat_id, info_id, f" သီချင်း ({len(tracks)}) ပုဒ်လုံး ပို့ပေးပြီးပါပြီ! ")
+    await edit_text(chat_id, info_id, f"✅ သီချင်း ({len(tracks)}) ပုဒ်လုံး ပို့ပေးပြီးပါပြီ! 🎶")
 
 
 async def post_song_to_channel(
@@ -783,10 +881,10 @@ async def post_song_to_channel(
     item = SHARE_CACHE.get(skey)
     cid = RUNTIME.get("channel_id", "").strip()
     if not item or not cid:
-        await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": " သီချင်းအချက်အလက် သက်တမ်းကုန်သွားပါပြီ။", "show_alert": True})
+        await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "⚠️ သီချင်းအချက်အလက် သက်တမ်းကုန်သွားပါပြီ။", "show_alert": True})
         return
     if item.get("shared"):
-        await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": " ဒီသီချင်းကို Channel မှာ တင်ပြီးသားဖြစ်ပါတယ်!", "show_alert": True})
+        await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "✅ ဒီသီချင်းကို Channel မှာ တင်ပြီးသားဖြစ်ပါတယ်!", "show_alert": True})
         return
 
     uid = from_user.get("id", 0)
@@ -800,24 +898,24 @@ async def post_song_to_channel(
     bname = RUNTIME.get("bot_username", "Music92827bot")
 
     if hide_profile:
-        sharer_line = " အမည်မဖော်လိုသူ (Profile ဖျောက်ထားသည်)"
+        sharer_line = "🕵️ အမည်မဖော်လိုသူ (Profile ဖျောက်ထားသည်)"
     else:
         safe_name = html.escape(full_name)
         if username:
-            sharer_line = f' <a href="https://t.me/{username}">{safe_name}</a> (@{html.escape(username)})'
+            sharer_line = f'👤 <a href="https://t.me/{username}">{safe_name}</a> (@{html.escape(username)})'
         else:
-            sharer_line = f' <a href="tg://user?id={uid}">{safe_name}</a>'
+            sharer_line = f'👤 <a href="tg://user?id={uid}">{safe_name}</a>'
 
     channel_caption = (
-        f" <b>{safe_title}</b>\n"
-        f" {safe_artist}\n\n"
-        f" မျှဝေသူ  {sharer_line}\n"
-        f" သီချင်းရှာရန်  @{bname}"
+        f"🎵 <b>{safe_title}</b>\n"
+        f"🎤 {safe_artist}\n\n"
+        f"🎧 မျှဝေသူ — {sharer_line}\n"
+        f"🤖 သီချင်းရှာရန် — @{bname}"
     )
 
     ch_kb = {
         "inline_keyboard": [
-            [{"text": " ဒီ Bot မှာ ကိုယ်တိုင် သီချင်းရှာမည်", "url": f"https://t.me/{bname}"}]
+            [{"text": "🎵 ဒီ Bot မှာ ကိုယ်တိုင် သီချင်းရှာမည်", "url": f"https://t.me/{bname}"}]
         ]
     }
 
@@ -836,15 +934,15 @@ async def post_song_to_channel(
     if res.get("ok"):
         item["shared"] = True
         RUNTIME["channel_shares"] += 1
-        mode_note = " Profile ဖျောက်ပြီး" if hide_profile else " သင့် Profile နှင့်တကွ"
-        await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": " Channel ပေါ် တင်ပြီးပါပြီ!"})
+        mode_note = "🕵️ Profile ဖျောက်ပြီး" if hide_profile else "👤 သင့် Profile နှင့်တကွ"
+        await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "🎉 Channel ပေါ် တင်ပြီးပါပြီ!"})
         await edit_text(
             user_chat_id,
             prompt_msg_id,
-            f" {item['title']} သီချင်းကို {mode_note} Channel ပေါ် တင်ပေးပြီးပါပြီ! ",
+            f"✅ 『{item['title']}』 သီချင်းကို {mode_note} Channel ပေါ် တင်ပေးပြီးပါပြီ! 🎉",
             reply_markup={
                 "inline_keyboard": [
-                    [{"text": " Channel တွင် သွားကြည့်မည်", "url": FORCE_INVITE_LINK}]
+                    [{"text": "📢 Channel တွင် သွားကြည့်မည်", "url": FORCE_INVITE_LINK}]
                 ]
             },
         )
@@ -854,20 +952,20 @@ async def post_song_to_channel(
             "answerCallbackQuery",
             {
                 "callback_query_id": cb_id,
-                "text": f" Channel ပေါ်တင်မရပါ ({desc[:80]})  Bot ကို Channel တွင် Post Messages ခွင့်ပြုထားကြောင်း စစ်ပေးပါ!",
+                "text": f"⚠️ Channel ပေါ်တင်မရပါ ({desc[:80]}) — Bot ကို Channel တွင် Post Messages ခွင့်ပြုထားကြောင်း စစ်ပေးပါ!",
                 "show_alert": True,
             },
         )
 
 
 async def handle_artist_search(chat_id: int, user_id: int, artist_name: str, reply_to: int):
-    status_id = await send_text(chat_id, f" အဆိုတော် {artist_name} ၏ သီချင်းများကို ရှာဖွေနေပါတယ်...", reply_to=reply_to)
+    status_id = await send_text(chat_id, f"🎤 အဆိုတော် 『{artist_name}』 ၏ သီချင်းများကို ရှာဖွေနေပါတယ်...", reply_to=reply_to)
     tracks = await search_tracks(artist_name, max_items=10)
     if not tracks:
         await edit_text(
             chat_id,
             status_id,
-            f" အဆိုတော် {artist_name} အတွက် သီချင်းရှာမတွေ့ပါဘူးနော်။ နာမည်စာလုံးပေါင်း ပြောင်းရေးကြည့်ပါ!",
+            f"❌ အဆိုတော် 『{artist_name}』 အတွက် သီချင်းရှာမတွေ့ပါဘူးနော်။ နာမည်စာလုံးပေါင်း ပြောင်းရေးကြည့်ပါ!",
             reply_markup={"inline_keyboard": [switch_mode_row()]},
         )
         return
@@ -880,28 +978,28 @@ async def handle_artist_search(chat_id: int, user_id: int, artist_name: str, rep
     buttons = []
     for idx, tr in enumerate(tracks, start=1):
         k = cache_track(tr)
-        buttons.append([{"text": f"{idx}.  {tr['title'][:40]} ({tr['dur']})", "callback_data": f"dl:{k}"}])
+        buttons.append([{"text": f"{idx}. 🎵 {tr['title'][:40]} ({tr['dur']})", "callback_data": f"dl:{k}"}])
 
-    buttons.append([{"text": f" ဒီထဲက သီချင်းအားလုံး ({len(tracks)} ပုဒ်) MP3 ယူမည်", "callback_data": f"dlall:{batch_key}"}])
+    buttons.append([{"text": f"📥 ဒီထဲက သီချင်းအားလုံး ({len(tracks)} ပုဒ်) MP3 ယူမည်", "callback_data": f"dlall:{batch_key}"}])
     buttons.append(switch_mode_row())
 
     await edit_text(
         chat_id,
         status_id,
-        f" အဆိုတော် {artist_name} ၏ သီချင်းခေါင်းစဉ်များ \n"
-        "ကြိုက်တဲ့သီချင်းကို တစ်ပုဒ်ချင်းဖြစ်စေ၊ အားလုံးဖြစ်စေ နှိပ်ပြီး MP3 ယူနိုင်ပါတယ် ",
+        f"🎤 အဆိုတော် 『{artist_name}』 ၏ သီချင်းခေါင်းစဉ်များ —\n"
+        "ကြိုက်တဲ့သီချင်းကို တစ်ပုဒ်ချင်းဖြစ်စေ၊ အားလုံးဖြစ်စေ နှိပ်ပြီး MP3 ယူနိုင်ပါတယ် 👇",
         reply_markup={"inline_keyboard": buttons},
     )
 
 
 async def handle_song_title_search(chat_id: int, user_id: int, song_query: str, reply_to: int):
-    status_id = await send_text(chat_id, f" {song_query} သီချင်းကို ရှာဖွေနေပါတယ်...", reply_to=reply_to)
+    status_id = await send_text(chat_id, f"🎵 『{song_query}』 သီချင်းကို ရှာဖွေနေပါတယ်...", reply_to=reply_to)
     tracks = await search_tracks(song_query, max_items=7)
     if not tracks:
         await edit_text(
             chat_id,
             status_id,
-            f" {song_query} သီချင်း ရှာမတွေ့ပါဘူးနော်။ စာလုံးပေါင်း ပြန်စစ်ပြီး ထပ်ပို့ကြည့်ပါ!",
+            f"❌ 『{song_query}』 သီချင်း ရှာမတွေ့ပါဘူးနော်။ စာလုံးပေါင်း ပြန်စစ်ပြီး ထပ်ပို့ကြည့်ပါ!",
             reply_markup={"inline_keyboard": [switch_mode_row()]},
         )
         return
@@ -915,18 +1013,18 @@ async def handle_song_title_search(chat_id: int, user_id: int, song_query: str, 
     buttons = []
     for tr in extras:
         k = cache_track(tr)
-        buttons.append([{"text": f" {tr['title'][:42]} ({tr['dur']})", "callback_data": f"dl:{k}"}])
+        buttons.append([{"text": f"🎶 {tr['title'][:42]} ({tr['dur']})", "callback_data": f"dl:{k}"}])
     buttons.append(switch_mode_row())
 
     if exact_matched:
         msg_txt = (
-            f" {top_track['title']} သီချင်းအမှန်ကို MP3 တန်းပို့ပေးနေပါပြီ!\n\n"
-            " အနီးစပ်ဆုံး တခြားသီချင်းများ (ထပ်ယူချင်ရင် နှိပ်ပါ) "
+            f"✅ 『{top_track['title']}』 သီချင်းအမှန်ကို MP3 တန်းပို့ပေးနေပါပြီ!\n\n"
+            "👇 အနီးစပ်ဆုံး တခြားသီချင်းများ (ထပ်ယူချင်ရင် နှိပ်ပါ) —"
         )
     else:
         msg_txt = (
-            f" {song_query} နှင့် အနီးစပ်ဆုံး သီချင်းများ \n"
-            f"(အနီးစပ်ဆုံး {top_track['title']} ကိုလည်း MP3 ပို့ပေးနေပါတယ် )"
+            f"🎶 『{song_query}』 နှင့် အနီးစပ်ဆုံး သီချင်းများ —\n"
+            f"(အနီးစပ်ဆုံး 『{top_track['title']}』 ကိုလည်း MP3 ပို့ပေးနေပါတယ် 👇)"
         )
 
     await edit_text(chat_id, status_id, msg_txt, reply_markup={"inline_keyboard": buttons})
@@ -944,11 +1042,283 @@ async def broadcast_to_users(admin_chat_id: int, bcast_text: str):
             await asyncio.sleep(0.05)
         except Exception:
             pass
-    await send_text(admin_chat_id, f" Broadcast ပို့ပြီးပါပြီ! (စုစုပေါင်း {sent}/{len(targets)} ဦးထံ ရောက်ရှိပါသည်)")
+    await send_text(admin_chat_id, f"✅ Broadcast ပို့ပြီးပါပြီ! (စုစုပေါင်း {sent}/{len(targets)} ဦးထံ ရောက်ရှိပါသည်)")
+
+
+async def process_music_update(update: dict):
+    """Non-blocking background processor so /webhook always returns 200 OK in <1ms!"""
+    try:
+        my_cm = update.get("my_chat_member")
+        if my_cm:
+            ch = my_cm.get("chat", {})
+            from_u = my_cm.get("from", {}).get("id", 0)
+            if ch.get("type") == "channel" and str(ch.get("id", "")).startswith("-100"):
+                save_channel_id(ch["id"], admin_uid=from_u)
+                if from_u:
+                    await send_text(
+                        from_u,
+                        f"✅ သင့် Channel ({ch.get('title', '')}) နဲ့ Force-Join + Channel Share စနစ် အလိုအလျောက် ချိတ်ဆက်ပြီးပါပြီ!\n"
+                        f"🆔 Channel ID: {ch['id']}\n"
+                        f"👉 အရေးကြီး — Render ရဲ့ Environment မှာ Key: CHANNEL_ID / Value: {ch['id']} ထည့်ထားလိုက်ပါနော်!",
+                    )
+            return
+
+        ch_post = update.get("channel_post")
+        if ch_post:
+            ch = ch_post.get("chat", {})
+            if ch.get("type") == "channel" and str(ch.get("id", "")).startswith("-100"):
+                save_channel_id(ch["id"])
+            return
+
+        cb = update.get("callback_query")
+        if cb:
+            cb_id = cb.get("id")
+            from_user = cb.get("from", {})
+            user_id = from_user.get("id")
+            msg = cb.get("message", {})
+            chat_id = msg.get("chat", {}).get("id")
+            msg_id = msg.get("message_id")
+            data = cb.get("data", "")
+
+            if user_id and user_id not in KNOWN_USERS:
+                KNOWN_USERS.add(user_id)
+                persist_state()
+
+            if data == "verify_join":
+                joined = await is_user_joined(user_id, from_verify_click=True)
+                if not joined:
+                    await tg_api(
+                        "answerCallbackQuery",
+                        {
+                            "callback_query_id": cb_id,
+                            "text": "❌ သင် Channel ကို မ Join ရသေးပါ! အပေါ်က ခလုတ်ကိုနှိပ်ပြီး အရင် Join ပေးပါနော်။",
+                            "show_alert": True,
+                        },
+                    )
+                else:
+                    await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "✅ Join ပြီးကြောင်း အတည်ပြုပြီးပါပြီ!"})
+                    await edit_text(chat_id, msg_id, MAIN_MENU_TEXT, reply_markup=main_menu_keyboard())
+                return
+
+            if not await is_user_joined(user_id):
+                await tg_api(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": cb_id,
+                        "text": "🔒 Channel ကို အရင် Join ပေးမှ ဆက်သုံးလို့ရပါမယ်နော်!",
+                        "show_alert": True,
+                    },
+                )
+                await send_text(chat_id, JOIN_PROMPT_TEXT, reply_markup=join_gate_keyboard())
+                return
+
+            if data.startswith("shpub:"):
+                await post_song_to_channel(data[6:], False, from_user, chat_id, msg_id, cb_id)
+                return
+
+            if data.startswith("shanon:"):
+                await post_song_to_channel(data[7:], True, from_user, chat_id, msg_id, cb_id)
+                return
+
+            if data == "shno":
+                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "ဟုတ်ကဲ့၊ Channel မှာ မတင်တော့ပါဘူးနော်!"})
+                try:
+                    await tg_api("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
+                except Exception:
+                    pass
+                return
+
+            if data == "mode:artist":
+                USER_MODE[user_id] = "artist"
+                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
+                await send_text(
+                    chat_id,
+                    "🎤 ရှာချင်တဲ့ 『အဆိုတော်နာမည်』 ကို ရေးပို့ပေးပါ!\n"
+                    "(ဥပမာ — မျိုးကြီး၊ လေးဖြူ၊ ဝေလ၊ G Fatt၊ Ed Sheeran)",
+                )
+                return
+
+            if data == "mode:song":
+                USER_MODE[user_id] = "song"
+                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
+                await send_text(
+                    chat_id,
+                    "🎵 ရှာချင်တဲ့ 『သီချင်းနာမည်』 ကို ရေးပို့ပေးပါ!\n"
+                    "(နာမည်မှန်ရင် Album Cover + MP3 တန်းပို့ပေးပြီး အနီးစပ်ဆုံး သီချင်းတွေပါ ပြပေးပါမယ်!)",
+                )
+                return
+
+            if data == "menu:trending":
+                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
+                if not TRENDING_COUNTER:
+                    await handle_artist_search(chat_id, user_id, "Myanmar New Song Hits", msg_id)
+                else:
+                    btns = []
+                    for k, cnt in TRENDING_COUNTER.most_common(8):
+                        tr = TRENDING_META.get(k)
+                        if tr:
+                            btns.append([{"text": f"🔥 {tr['title'][:38]} ({cnt}x)", "callback_data": f"dl:{k}"}])
+                    btns.append(switch_mode_row())
+                    await send_text(chat_id, "🔥 ယနေ့ လူဒေါင်းအများဆုံး သီချင်းများ 👇", reply_markup={"inline_keyboard": btns})
+                return
+
+            if data == "menu:favs":
+                favs = USER_FAVS.get(user_id, [])
+                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
+                if not favs:
+                    await send_text(
+                        chat_id,
+                        "❤️ သိမ်းထားသော သီချင်း မရှိသေးပါ!\nသီချင်းဒေါင်းပြီးတိုင်း အောက်က 『❤️ သိမ်းထားမည်』 ခလုတ်ကို နှိပ်သိမ်းထားနိုင်ပါတယ်။",
+                        reply_markup=main_menu_keyboard(),
+                    )
+                else:
+                    btns = []
+                    for tr in favs[-10:]:
+                        k = cache_track(tr)
+                        btns.append([{"text": f"❤️ {tr['title'][:40]} ({tr['dur']})", "callback_data": f"dl:{k}"}])
+                    btns.append(switch_mode_row())
+                    await send_text(chat_id, "❤️ သင် သိမ်းထားသော အကြိုက်ဆုံး သီချင်းများ 👇", reply_markup={"inline_keyboard": btns})
+                return
+
+            if data.startswith("fav:"):
+                key = data[4:]
+                tr = SEARCH_CACHE.get(key)
+                if tr:
+                    fav_list = USER_FAVS.setdefault(user_id, [])
+                    if not any(x["url"] == tr["url"] for x in fav_list):
+                        fav_list.append(tr)
+                    await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "❤️ အကြိုက်ဆုံးစာရင်းထဲ သိမ်းပြီးပါပြီ!"})
+                else:
+                    await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "⚠️ ပြန်ရှာပြီးမှ သိမ်းပေးပါနော်။"})
+                return
+
+            if data.startswith("lyr:"):
+                key = data[4:]
+                tr = SEARCH_CACHE.get(key)
+                if not tr:
+                    await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "⚠️ သီချင်းအချက်အလက် မတွေ့ပါ။", "show_alert": True})
+                    return
+                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "📜 သီချင်းစာသား ရှာပေးနေပါတယ်..."})
+                q_str = f"{tr.get('raw_title', tr['title'])} {tr.get('artist', '')}".strip()
+                lyr = await fetch_song_lyrics(q_str) or await fetch_song_lyrics(tr.get("raw_title", tr["title"]))
+                if lyr:
+                    await send_text(chat_id, lyr)
+                else:
+                    await send_text(chat_id, f"⚠️ 『{tr['title']}』 အတွက် သီချင်းစာသား (Lyrics) Database ထဲတွင် မရှိသေးပါနော်။")
+                return
+
+            if data.startswith("dl:"):
+                key = data[3:]
+                tr = SEARCH_CACHE.get(key)
+                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "🎧 MP3 ပို့ပေးနေပါပြီ..."})
+                if not tr:
+                    await send_text(chat_id, "⚠️ စာရင်းသက်တမ်းကုန်သွားလို့ နာမည်ပြန်ရိုက်ရှာပေးပါနော်။")
+                else:
+                    await send_single_mp3(chat_id, user_id, tr["url"], tr["title"])
+                return
+
+            if data.startswith("dlall:"):
+                bkey = data[6:]
+                tracks = BATCH_CACHE.get(bkey)
+                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "📥 သီချင်းအားလုံး ပို့ပေးနေပါပြီ..."})
+                if not tracks:
+                    await send_text(chat_id, "⚠️ စာရင်းသက်တမ်းကုန်သွားလို့ အဆိုတော်နာမည် ပြန်ရိုက်ရှာပေးပါနော်။")
+                else:
+                    await send_batch_mp3(chat_id, user_id, tracks)
+                return
+
+            return
+
+        msg = update.get("message")
+        if not msg:
+            return
+
+        chat_id = msg.get("chat", {}).get("id")
+        user_id = msg.get("from", {}).get("id")
+        msg_id = msg.get("message_id")
+
+        if user_id and user_id not in KNOWN_USERS:
+            KNOWN_USERS.add(user_id)
+            persist_state()
+
+        fwd_origin = msg.get("forward_origin") or {}
+        fwd_chat = fwd_origin.get("chat") or msg.get("forward_from_chat") or {}
+        if fwd_chat.get("type") == "channel" and str(fwd_chat.get("id", "")).startswith("-100"):
+            save_channel_id(fwd_chat["id"], admin_uid=user_id)
+            await send_text(
+                chat_id,
+                f"✅ Channel ({fwd_chat.get('title', '')}) ကို မှတ်သားပြီးပါပြီ!\n"
+                f"🆔 Channel ID: {fwd_chat['id']}\n👑 သင့်ကိုလည်း Admin အဖြစ် မှတ်သားထားပါပြီ!",
+                reply_to=msg_id,
+            )
+            return
+
+        text = (msg.get("text") or msg.get("caption") or "").strip()
+        if not chat_id or not user_id or not text:
+            return
+
+        if text.startswith("/admin") and (user_id == RUNTIME.get("admin_id") or not RUNTIME.get("admin_id")):
+            if not RUNTIME.get("admin_id"):
+                RUNTIME["admin_id"] = user_id
+                persist_state()
+            await send_text(
+                chat_id,
+                f"👑 VIP Music Bot Admin Panel (v2)\n\n"
+                f"👥 စုစုပေါင်း အသုံးပြုသူ: {len(KNOWN_USERS)} ဦး\n"
+                f"🎵 ပို့ပေးပြီးသော MP3 ပေါင်း: {RUNTIME['songs_sent']} ပုဒ်\n"
+                f"📢 Channel ပေါ် ပြန်တင်ထားမှု: {RUNTIME['channel_shares']} ကြိမ်\n"
+                f"🛡️ ကြားဖြတ် Webhook ကာကွယ်ပြီးမှု: {RUNTIME['hijacks_blocked']} ကြိမ်\n"
+                f"🔒 Force-Join Channel ID: {RUNTIME['channel_id'] or 'Channel စာတစ်စောင် Forward ပို့ပေးပါ'}\n\n"
+                f"📣 လူအားလုံးထံ စာပို့လိုပါက —\n/broadcast မင်္ဂလာပါ သီချင်းအသစ်တွေ ဒေါင်းလို့ရပြီနော်!",
+                reply_to=msg_id,
+            )
+            return
+
+        if text.startswith("/broadcast ") and user_id == RUNTIME.get("admin_id"):
+            b_msg = text[len("/broadcast ") :].strip()
+            if b_msg:
+                await broadcast_to_users(chat_id, b_msg)
+            return
+
+        if not await is_user_joined(user_id):
+            await send_text(chat_id, JOIN_PROMPT_TEXT, reply_to=msg_id, reply_markup=join_gate_keyboard())
+            return
+
+        if text.startswith("/start") or text.startswith("/menu"):
+            await send_text(chat_id, MAIN_MENU_TEXT, reply_to=msg_id, reply_markup=main_menu_keyboard())
+            return
+
+        url_match = re.search(r"https?://[^\s<>\"']+", text)
+        if url_match:
+            raw_url = url_match.group(0).rstrip(".,!?;:)")
+            await send_single_mp3(chat_id, user_id, raw_url, "", reply_to=msg_id)
+            return
+
+        mode = USER_MODE.get(user_id)
+        if not mode:
+            await send_text(
+                chat_id,
+                "👇 အရင်ဆုံး 『အဆိုတော်နာမည်』 နဲ့ ရှာမလား၊ 『သီချင်းနာမည်』 နဲ့ ရှာမလား ရွေးပေးပါနော် —",
+                reply_to=msg_id,
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        if mode == "artist":
+            await handle_artist_search(chat_id, user_id, text, reply_to=msg_id)
+        else:
+            await handle_song_title_search(chat_id, user_id, text, reply_to=msg_id)
+
+    except Exception:
+        logger.exception("Unhandled error in process_music_update")
 
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
+    if WEBHOOK_SECRET:
+        hdr_sec = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if hdr_sec and hdr_sec != WEBHOOK_SECRET:
+            return JSONResponse({"ok": False}, status_code=403)
     try:
         update = await request.json()
     except Exception:
@@ -960,282 +1330,7 @@ async def telegram_webhook(request: Request):
     if update_id is not None:
         processed_updates.append(update_id)
 
-    # 1. Auto-capture Private Channel ID & Admin ID
-    my_cm = update.get("my_chat_member")
-    if my_cm:
-        ch = my_cm.get("chat", {})
-        from_u = my_cm.get("from", {}).get("id", 0)
-        if ch.get("type") == "channel" and str(ch.get("id", "")).startswith("-100"):
-            save_channel_id(ch["id"], admin_uid=from_u)
-            if from_u:
-                asyncio.create_task(
-                    send_text(
-                        from_u,
-                        f" သင့် Channel ({ch.get('title', '')}) နဲ့ Force-Join + Channel Share စနစ် အလိုအလျောက် ချိတ်ဆက်ပြီးပါပြီ!\n"
-                        f" Channel ID: {ch['id']}\n"
-                        f"(Server ပြန်စတိုင်း အမြဲမှတ်မိနေအောင် Render ရဲ့ Environment မှာ Key: CHANNEL_ID / Value: {ch['id']} ထည့်ထားနိုင်ပါတယ်!)",
-                    )
-                )
-        return JSONResponse({"ok": True})
-
-    ch_post = update.get("channel_post")
-    if ch_post:
-        ch = ch_post.get("chat", {})
-        if ch.get("type") == "channel" and str(ch.get("id", "")).startswith("-100"):
-            save_channel_id(ch["id"])
-        return JSONResponse({"ok": True})
-
-    # 2. Callback Button Clicks
-    cb = update.get("callback_query")
-    if cb:
-        cb_id = cb.get("id")
-        from_user = cb.get("from", {})
-        user_id = from_user.get("id")
-        msg = cb.get("message", {})
-        chat_id = msg.get("chat", {}).get("id")
-        msg_id = msg.get("message_id")
-        data = cb.get("data", "")
-
-        if user_id and user_id not in KNOWN_USERS:
-            KNOWN_USERS.add(user_id)
-            persist_state()
-
-        if data == "verify_join":
-            joined = await is_user_joined(user_id)
-            if not joined:
-                alert_msg = (
-                    " Bot Admin မှ Channel ထဲတွင် @Music92827bot ကို Admin အရင်ခန့်ပေးရန် လိုအပ်ပါသည်!"
-                    if not RUNTIME.get("channel_id")
-                    else " သင် Channel ကို မ Join ရသေးပါ! အပေါ်က ခလုတ်ကိုနှိပ်ပြီး အရင် Join ပေးပါနော်။"
-                )
-                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": alert_msg, "show_alert": True})
-            else:
-                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": " Join ပြီးကြောင်း အတည်ပြုပြီးပါပြီ!"})
-                await edit_text(chat_id, msg_id, MAIN_MENU_TEXT, reply_markup=main_menu_keyboard())
-            return JSONResponse({"ok": True})
-
-        if not await is_user_joined(user_id):
-            await tg_api(
-                "answerCallbackQuery",
-                {
-                    "callback_query_id": cb_id,
-                    "text": " Channel ကို အရင် Join ပေးမှ ဆက်သုံးလို့ရပါမယ်နော်!",
-                    "show_alert": True,
-                },
-            )
-            await send_text(chat_id, JOIN_PROMPT_TEXT, reply_markup=join_gate_keyboard())
-            return JSONResponse({"ok": True})
-
-        # Channel Share Handlers (Public Profile vs Hidden Profile / Cancel)
-        if data.startswith("shpub:"):
-            skey = data[6:]
-            asyncio.create_task(post_song_to_channel(skey, False, from_user, chat_id, msg_id, cb_id))
-            return JSONResponse({"ok": True})
-
-        if data.startswith("shanon:"):
-            skey = data[7:]
-            asyncio.create_task(post_song_to_channel(skey, True, from_user, chat_id, msg_id, cb_id))
-            return JSONResponse({"ok": True})
-
-        if data == "shno":
-            await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "ဟုတ်ကဲ့၊ Channel မှာ မတင်တော့ပါဘူးနော်!"})
-            try:
-                await tg_api("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
-            except Exception:
-                pass
-            return JSONResponse({"ok": True})
-
-        if data == "mode:artist":
-            USER_MODE[user_id] = "artist"
-            await tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
-            await send_text(
-                chat_id,
-                " ရှာချင်တဲ့ အဆိုတော်နာမည် ကို ရေးပို့ပေးပါ!\n"
-                "(ဥပမာ  မျိုးကြီး၊ လေးဖြူ၊ ဝေလ၊ G Fatt၊ Ed Sheeran)",
-            )
-            return JSONResponse({"ok": True})
-
-        if data == "mode:song":
-            USER_MODE[user_id] = "song"
-            await tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
-            await send_text(
-                chat_id,
-                " ရှာချင်တဲ့ သီချင်းနာမည် ကို ရေးပို့ပေးပါ!\n"
-                "(နာမည်မှန်ရင် Album Cover + MP3 တန်းပို့ပေးပြီး အနီးစပ်ဆုံး သီချင်းတွေပါ ပြပေးပါမယ်!)",
-            )
-            return JSONResponse({"ok": True})
-
-        if data == "menu:trending":
-            await tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
-            if not TRENDING_COUNTER:
-                asyncio.create_task(handle_artist_search(chat_id, user_id, "Myanmar New Song Hits", msg_id))
-            else:
-                btns = []
-                for k, cnt in TRENDING_COUNTER.most_common(8):
-                    tr = TRENDING_META.get(k)
-                    if tr:
-                        btns.append([{"text": f" {tr['title'][:38]} ({cnt}x)", "callback_data": f"dl:{k}"}])
-                btns.append(switch_mode_row())
-                await send_text(chat_id, " ယနေ့ လူဒေါင်းအများဆုံး သီချင်းများ ", reply_markup={"inline_keyboard": btns})
-            return JSONResponse({"ok": True})
-
-        if data == "menu:favs":
-            favs = USER_FAVS.get(user_id, [])
-            await tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
-            if not favs:
-                await send_text(
-                    chat_id,
-                    " သိမ်းထားသော သီချင်း မရှိသေးပါ!\nသီချင်းဒေါင်းပြီးတိုင်း အောက်က  သိမ်းထားမည် ခလုတ်ကို နှိပ်သိမ်းထားနိုင်ပါတယ်။",
-                    reply_markup=main_menu_keyboard(),
-                )
-            else:
-                btns = []
-                for tr in favs[-10:]:
-                    k = cache_track(tr)
-                    btns.append([{"text": f" {tr['title'][:40]} ({tr['dur']})", "callback_data": f"dl:{k}"}])
-                btns.append(switch_mode_row())
-                await send_text(chat_id, " သင် သိမ်းထားသော အကြိုက်ဆုံး သီချင်းများ ", reply_markup={"inline_keyboard": btns})
-            return JSONResponse({"ok": True})
-
-        if data.startswith("fav:"):
-            key = data[4:]
-            tr = SEARCH_CACHE.get(key)
-            if tr:
-                fav_list = USER_FAVS.setdefault(user_id, [])
-                if not any(x["url"] == tr["url"] for x in fav_list):
-                    fav_list.append(tr)
-                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": " အကြိုက်ဆုံးစာရင်းထဲ သိမ်းပြီးပါပြီ!"})
-            else:
-                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": " ပြန်ရှာပြီးမှ သိမ်းပေးပါနော်။"})
-            return JSONResponse({"ok": True})
-
-        if data.startswith("lyr:"):
-            key = data[4:]
-            tr = SEARCH_CACHE.get(key)
-            if not tr:
-                await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": " သီချင်းအချက်အလက် မတွေ့ပါ။", "show_alert": True})
-                return JSONResponse({"ok": True})
-            await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": " သီချင်းစာသား ရှာပေးနေပါတယ်..."})
-
-            async def _send_lyrics():
-                q_str = f"{tr.get('raw_title', tr['title'])} {tr.get('artist', '')}".strip()
-                lyr = await fetch_song_lyrics(q_str) or await fetch_song_lyrics(tr.get("raw_title", tr["title"]))
-                if lyr:
-                    await send_text(chat_id, lyr)
-                else:
-                    await send_text(chat_id, f" {tr['title']} အတွက် သီချင်းစာသား (Lyrics) Database ထဲတွင် မရှိသေးပါနော်။")
-
-            asyncio.create_task(_send_lyrics())
-            return JSONResponse({"ok": True})
-
-        if data.startswith("dl:"):
-            key = data[3:]
-            tr = SEARCH_CACHE.get(key)
-            await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": " MP3 ပို့ပေးနေပါပြီ..."})
-            if not tr:
-                await send_text(chat_id, " စာရင်းသက်တမ်းကုန်သွားလို့ နာမည်ပြန်ရိုက်ရှာပေးပါနော်။")
-            else:
-                asyncio.create_task(send_single_mp3(chat_id, user_id, tr["url"], tr["title"]))
-            return JSONResponse({"ok": True})
-
-        if data.startswith("dlall:"):
-            bkey = data[6:]
-            tracks = BATCH_CACHE.get(bkey)
-            await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": " သီချင်းအားလုံး ပို့ပေးနေပါပြီ..."})
-            if not tracks:
-                await send_text(chat_id, " စာရင်းသက်တမ်းကုန်သွားလို့ အဆိုတော်နာမည် ပြန်ရိုက်ရှာပေးပါနော်။")
-            else:
-                asyncio.create_task(send_batch_mp3(chat_id, user_id, tracks))
-            return JSONResponse({"ok": True})
-
-        return JSONResponse({"ok": True})
-
-    # 3. Incoming Messages
-    msg = update.get("message")
-    if not msg:
-        return JSONResponse({"ok": True})
-
-    chat_id = msg.get("chat", {}).get("id")
-    user_id = msg.get("from", {}).get("id")
-    msg_id = msg.get("message_id")
-
-    if user_id and user_id not in KNOWN_USERS:
-        KNOWN_USERS.add(user_id)
-        persist_state()
-
-    fwd_origin = msg.get("forward_origin") or {}
-    fwd_chat = fwd_origin.get("chat") or msg.get("forward_from_chat") or {}
-    if fwd_chat.get("type") == "channel" and str(fwd_chat.get("id", "")).startswith("-100"):
-        save_channel_id(fwd_chat["id"], admin_uid=user_id)
-        asyncio.create_task(
-            send_text(
-                chat_id,
-                f" Channel ({fwd_chat.get('title', '')}) ကို မှတ်သားပြီးပါပြီ!\n"
-                f" Channel ID: {fwd_chat['id']}\n သင့်ကိုလည်း Admin အဖြစ် မှတ်သားထားပါပြီ!",
-                reply_to=msg_id,
-            )
-        )
-        return JSONResponse({"ok": True})
-
-    text = (msg.get("text") or msg.get("caption") or "").strip()
-    if not chat_id or not user_id or not text:
-        return JSONResponse({"ok": True})
-
-    if text.startswith("/admin") and (user_id == RUNTIME.get("admin_id") or not RUNTIME.get("admin_id")):
-        if not RUNTIME.get("admin_id"):
-            RUNTIME["admin_id"] = user_id
-            persist_state()
-        asyncio.create_task(
-            send_text(
-                chat_id,
-                f" VIP Music Bot Admin Panel\n\n"
-                f" စုစုပေါင်း အသုံးပြုသူ: {len(KNOWN_USERS)} ဦး\n"
-                f" ပို့ပေးပြီးသော MP3 ပေါင်း: {RUNTIME['songs_sent']} ပုဒ်\n"
-                f" Channel ပေါ် ပြန်တင်ထားမှု: {RUNTIME['channel_shares']} ကြိမ်\n"
-                f" Force-Join Channel ID: {RUNTIME['channel_id'] or 'မချိတ်ရသေးပါ'}\n\n"
-                f" လူအားလုံးထံ စာပို့လိုပါက \n/broadcast မင်္ဂလာပါ သီချင်းအသစ်တွေ ဒေါင်းလို့ရပြီနော်!",
-                reply_to=msg_id,
-            )
-        )
-        return JSONResponse({"ok": True})
-
-    if text.startswith("/broadcast ") and user_id == RUNTIME.get("admin_id"):
-        b_msg = text[len("/broadcast ") :].strip()
-        if b_msg:
-            asyncio.create_task(broadcast_to_users(chat_id, b_msg))
-        return JSONResponse({"ok": True})
-
-    if not await is_user_joined(user_id):
-        asyncio.create_task(send_text(chat_id, JOIN_PROMPT_TEXT, reply_to=msg_id, reply_markup=join_gate_keyboard()))
-        return JSONResponse({"ok": True})
-
-    if text.startswith("/start") or text.startswith("/menu"):
-        asyncio.create_task(send_text(chat_id, MAIN_MENU_TEXT, reply_to=msg_id, reply_markup=main_menu_keyboard()))
-        return JSONResponse({"ok": True})
-
-    url_match = re.search(r"https?://[^\s<>\"']+", text)
-    if url_match:
-        raw_url = url_match.group(0).rstrip(".,!?;:)")
-        asyncio.create_task(send_single_mp3(chat_id, user_id, raw_url, "", reply_to=msg_id))
-        return JSONResponse({"ok": True})
-
-    mode = USER_MODE.get(user_id)
-    if not mode:
-        asyncio.create_task(
-            send_text(
-                chat_id,
-                " အရင်ဆုံး အဆိုတော်နာမည် နဲ့ ရှာမလား၊ သီချင်းနာမည် နဲ့ ရှာမလား ရွေးပေးပါနော် ",
-                reply_to=msg_id,
-                reply_markup=main_menu_keyboard(),
-            )
-        )
-        return JSONResponse({"ok": True})
-
-    if mode == "artist":
-        asyncio.create_task(handle_artist_search(chat_id, user_id, text, reply_to=msg_id))
-    else:
-        asyncio.create_task(handle_song_title_search(chat_id, user_id, text, reply_to=msg_id))
-
+    asyncio.create_task(process_music_update(update))
     return JSONResponse({"ok": True})
 
 
